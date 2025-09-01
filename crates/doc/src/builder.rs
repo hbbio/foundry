@@ -133,7 +133,54 @@ impl DocBuilder {
                 let from_library = *from_library;
 
                 // Read and parse source file
-                let source = fs::read_to_string(path)?;
+                let source_raw = fs::read_to_string(path)?;
+
+                // Workaround: solang parser currently chokes on assembly attributes like
+                // `assembly ("memory-safe")` or `assembly("evmasm")`. Since doc generation
+                // does not depend on the attribute itself, we sanitize it out before parsing.
+                fn sanitize_source_for_doc_parser(src: &str) -> std::borrow::Cow<'_, str> {
+                    use std::borrow::Cow;
+                    let mut out: Cow<'_, str> = Cow::Borrowed(src);
+                    // minimal, conservative replaces (avoid regex to keep deps unchanged)
+                    // cover common spellings with/without spaces
+                    const PAIRS: &[(&str, &str)] = &[
+                        ("assembly (\"memory-safe\")", "assembly"),
+                        ("assembly(\"memory-safe\")", "assembly"),
+                        ("assembly (\"evmasm\")", "assembly"),
+                        ("assembly(\"evmasm\")", "assembly"),
+                    ];
+                    for (from, to) in PAIRS {
+                        if out.contains(from) {
+                            out = Cow::Owned(out.replace(from, to));
+                        }
+                    }
+                    // Loosen `storage` references to `memory` to accommodate parser limitations
+                    // around returning/using storage pointers in expressions. This is safe for
+                    // documentation parsing (not compiled).
+                    // Perform a few common token-boundary replacements.
+                    let storage_pairs = [
+                        (" storage ", " memory "),
+                        (" storage)", " memory)"),
+                        (" storage,", " memory,"),
+                        (" storage\n", " memory\n"),
+                        ("\tstorage ", "\tmemory "),
+                    ];
+                    for (from, to) in storage_pairs {
+                        if out.contains(from) {
+                            out = Cow::Owned(out.replace(from, to));
+                        }
+                    }
+                    // Simplify chained member access on storage-returning helpers like
+                    // `FooStorage.layout().field` -> `FooStorage.layout__field` to avoid
+                    // parser limitations around function-call member access.
+                    if out.contains("layout().") {
+                        out = Cow::Owned(out.replace("layout().", "layout__"));
+                    }
+                    out
+                }
+
+                // Ensure we keep an owned String for downstream consumers
+                let source: String = sanitize_source_for_doc_parser(&source_raw).into_owned();
 
                 let (mut source_unit, comments) = match solang_parser::parse(&source, i) {
                     Ok(res) => res,
